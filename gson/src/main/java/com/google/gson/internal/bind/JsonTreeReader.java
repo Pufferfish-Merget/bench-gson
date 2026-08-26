@@ -385,6 +385,11 @@ public final class JsonTreeReader extends JsonReader {
     return getPath(true);
   }
 
+  @Override
+  public long getCharacterOffset() {
+    return -1L;
+  }
+
   private String locationString() {
     return " at path " + getPath();
   }
