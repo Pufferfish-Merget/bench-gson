@@ -267,6 +267,8 @@ public class JsonReader implements Closeable {
   private int pos = 0;
   private int limit = 0;
 
+  private long bufferStart = 0;
+
   private int lineNumber = 0;
   private int lineStart = 0;
 
@@ -853,7 +855,7 @@ public class JsonReader implements Closeable {
             value = -(c - '0');
             last = NUMBER_CHAR_DIGIT;
           } else if (last == NUMBER_CHAR_DIGIT) {
-            if (value == 0) {
+            if (fitsInLong && value == 0) {
               return PEEKED_NONE; // Leading '0' prefix is not allowed (since it could be octal).
             }
             long newValue = value * 10 - (c - '0');
@@ -1050,7 +1052,15 @@ public class JsonReader implements Closeable {
     }
 
     peeked = PEEKED_BUFFERED;
-    double result = Double.parseDouble(peekedString); // don't catch this NumberFormatException.
+    double result;
+    try {
+      result = Double.parseDouble(peekedString);
+    } catch (NumberFormatException e) {
+      NumberFormatException rethrown =
+          new NumberFormatException("Expected a double but was " + peekedString + locationString());
+      rethrown.initCause(e);
+      throw rethrown;
+    }
     if (strictness != Strictness.LENIENT && (Double.isNaN(result) || Double.isInfinite(result))) {
       throw syntaxError("JSON forbids NaN and infinities: " + result);
     }
@@ -1090,6 +1100,7 @@ public class JsonReader implements Closeable {
       } else {
         peekedString = nextQuotedValue(p == PEEKED_SINGLE_QUOTED ? '\'' : '"');
       }
+      validateAscii(peekedString);
       try {
         long result = Long.parseLong(peekedString);
         peeked = PEEKED_NONE;
@@ -1103,7 +1114,15 @@ public class JsonReader implements Closeable {
     }
 
     peeked = PEEKED_BUFFERED;
-    double asDouble = Double.parseDouble(peekedString); // don't catch this NumberFormatException.
+    double asDouble;
+    try {
+      asDouble = Double.parseDouble(peekedString);
+    } catch (NumberFormatException e) {
+      NumberFormatException rethrown =
+          new NumberFormatException("Expected a long but was " + peekedString + locationString());
+      rethrown.initCause(e);
+      throw rethrown;
+    }
     long result = (long) asDouble;
     if (result != asDouble) { // Make sure no precision was lost casting to 'long'.
       throw new NumberFormatException("Expected a long but was " + peekedString + locationString());
@@ -1142,10 +1161,10 @@ public class JsonReader implements Closeable {
           pos = p;
           int len = p - start - 1;
           if (builder == null) {
-            return new String(buffer, start, len);
+            return validateString(new String(buffer, start, len));
           } else {
             builder.append(buffer, start, len);
-            return builder.toString();
+            return validateString(builder.toString());
           }
         } else if (c == '\\') {
           pos = p;
@@ -1175,6 +1194,25 @@ public class JsonReader implements Closeable {
         throw syntaxError("Unterminated string");
       }
     }
+  }
+
+  /** Validates that a string does not contain unpaired UTF-16 surrogate characters. */
+  private String validateString(String value) throws IOException {
+    if (strictness != Strictness.STRICT) {
+      return value;
+    }
+    for (int i = 0; i < value.length(); i++) {
+      char c = value.charAt(i);
+      if (Character.isSurrogate(c)) {
+        if (Character.isHighSurrogate(c)
+            && i + 1 < value.length()
+            && Character.isLowSurrogate(value.charAt(++i))) {
+          continue;
+        }
+        throw syntaxError("Unpaired surrogate characters are not allowed in strict mode");
+      }
+    }
+    return value;
   }
 
   /** Returns an unquoted value as a string. */
@@ -1332,6 +1370,7 @@ public class JsonReader implements Closeable {
       } else {
         peekedString = nextQuotedValue(p == PEEKED_SINGLE_QUOTED ? '\'' : '"');
       }
+      validateAscii(peekedString);
       try {
         result = Integer.parseInt(peekedString);
         peeked = PEEKED_NONE;
@@ -1345,7 +1384,15 @@ public class JsonReader implements Closeable {
     }
 
     peeked = PEEKED_BUFFERED;
-    double asDouble = Double.parseDouble(peekedString); // don't catch this NumberFormatException.
+    double asDouble;
+    try {
+      asDouble = Double.parseDouble(peekedString);
+    } catch (NumberFormatException e) {
+      NumberFormatException rethrown =
+          new NumberFormatException("Expected an int but was " + peekedString + locationString());
+      rethrown.initCause(e);
+      throw rethrown;
+    }
     result = (int) asDouble;
     if (result != asDouble) { // Make sure no precision was lost casting to 'int'.
       throw new NumberFormatException("Expected an int but was " + peekedString + locationString());
@@ -1486,6 +1533,7 @@ public class JsonReader implements Closeable {
   private boolean fillBuffer(int minimum) throws IOException {
     char[] buffer = this.buffer;
     lineStart -= pos;
+    bufferStart += pos;
     if (limit != pos) {
       limit -= pos;
       System.arraycopy(buffer, pos, buffer, 0, limit);
@@ -1733,6 +1781,17 @@ public class JsonReader implements Closeable {
   }
 
   /**
+   * Returns the 0-based character offset of the current position in the JSON stream, or {@code -1}
+   * if not reading from a character stream.
+   *
+   * @return the character offset from the beginning of the stream, or {@code -1}
+   * @since $next-version$
+   */
+  public long getCharacterOffset() {
+    return bufferStart + pos;
+  }
+
+  /**
    * Unescapes the character identified by the character or characters that immediately follow a
    * backslash. The backslash '\' should have already been read. This supports both Unicode escapes
    * "u000A" and two-character escapes "\n".
@@ -1851,6 +1910,14 @@ public class JsonReader implements Closeable {
 
     // we consumed a security token!
     pos += 5;
+  }
+
+  private void validateAscii(String s) throws MalformedJsonException {
+    for (int i = 0; i < s.length(); i++) {
+      if (s.charAt(i) > 127) {
+        throw syntaxError("String contains non-ASCII characters: " + s);
+      }
+    }
   }
 
   static {
